@@ -4,6 +4,9 @@ import os
 import asyncio
 from config import Config
 from database import DatabaseManager
+from dotenv import load_dotenv
+load_dotenv()
+TOKEN = os.getenv("BOT_TOKEN")
 
 class BunnyBot(commands.Bot):
     def __init__(self):
