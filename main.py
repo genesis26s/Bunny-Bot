@@ -76,7 +76,7 @@ bot = BunnyBot()
 
 async def main():
     async with bot:
-        await bot.start(Config.BOT_TOKEN)
+        await bot.start(BOT_TOKEN)
 
 if __name__ == "__main__":
     asyncio.run(main())
