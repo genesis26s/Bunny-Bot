@@ -1,10 +1,10 @@
 import os
 
 class Config:
-    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    BOT_TOKEN = os.getenv("BUNNY_BOT_TOKEN")
     PREFIX = "!"
     DATABASE = "bunny_bot.db"
-
+    
     # Economy
     STARTING_BALANCE = 500
     DAILY_AMOUNT = 1000
@@ -17,30 +17,30 @@ class Config:
     BANK_INTEREST_RATE = 0.02
     BANK_UPGRADE_COST = 5000
     BANK_LIMIT_BASE = 10000
-
+    
     # Levels
     XP_PER_LEVEL = 100
     LEVEL_MULTIPLIER = 1.5
     PRESTIGE_COST = 100000
-
+    
     # Gambling
     SLOTS_JACKPOT = 10000
     LOTTERY_TICKET = 100
     LOTTERY_JACKPOT_BASE = 10000
-
+    
     # Market
     MARKET_TAX = 0.05
     VALUE_UPDATE_INTERVAL = 3600
-
+    
     # Adventure
     ADVENTURE_COOLDOWN = 300
-
+    
     # Colors
     EMBED_COLOR = 0xFFB6C1
     ERROR_COLOR = 0xFF0000
     SUCCESS_COLOR = 0x00FF00
     GOLD_COLOR = 0xFFD700
-
+    
     # Demand/Supply
     DEMAND_MULTIPLIER = 0.005
     MAX_VALUE_MULTIPLIER = 5.0
