@@ -1,7 +1,7 @@
 import os
 
 class Config:
-    BOT_TOKEN = os.getenv("BUNNY_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE", "BOT_TOKEN")
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
     PREFIX = "!"
     DATABASE = "bunny_bot.db"
 
