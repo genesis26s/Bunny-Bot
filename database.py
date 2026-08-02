@@ -1,473 +1,324 @@
-import aiosqlite
-import json
-from datetime import datetime
-from typing import Optional, List, Dict, Any
+import sqlite3
+import math
+import time
+from contextlib import contextmanager
+from config import (
+    STARTING_BALANCE, STARTING_BANK, XP_PER_LEVEL_BASE, XP_SCALE_FACTOR,
+    DEMAND_SHIFT_BUY, SUPPLY_SHIFT_BUY, DEMAND_SHIFT_SELL, SUPPLY_SHIFT_SELL,
+    PRICE_CLAMP_LOW, PRICE_CLAMP_HIGH,
+)
 
-class DatabaseManager:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
+DB_PATH = "bunny_bot.db"
 
-    async def init(self):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    balance INTEGER DEFAULT 0,
-                    bank_balance INTEGER DEFAULT 0,
-                    bank_limit INTEGER DEFAULT 10000,
-                    xp INTEGER DEFAULT 0,
-                    level INTEGER DEFAULT 1,
-                    prestige INTEGER DEFAULT 0,
-                    job_id INTEGER,
-                    job_exp INTEGER DEFAULT 0,
-                    job_promotions INTEGER DEFAULT 0,
-                    last_daily TEXT,
-                    last_weekly TEXT,
-                    last_work TEXT,
-                    last_crime TEXT,
-                    last_rob TEXT,
-                    last_adventure TEXT,
-                    active_pet INTEGER,
-                    property_count INTEGER DEFAULT 0,
-                    perk_slots INTEGER DEFAULT 3,
-                    created_at TEXT
-                )
-            """)
 
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS items (
-                    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT UNIQUE,
-                    description TEXT,
-                    category TEXT,
-                    base_value INTEGER,
-                    current_value INTEGER,
-                    rarity TEXT,
-                    demand_score REAL DEFAULT 0,
-                    supply_score REAL DEFAULT 0,
-                    last_value_update TEXT,
-                    enchantable INTEGER DEFAULT 0,
-                    usable INTEGER DEFAULT 0,
-                    equipable INTEGER DEFAULT 0,
-                    craftable INTEGER DEFAULT 0,
-                    craft_recipe TEXT
-                )
-            """)
+# ── Connection helper ──────────────────────────────────────────────────────────
 
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS inventory (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    item_id INTEGER,
-                    quantity INTEGER DEFAULT 1,
-                    enchantments TEXT DEFAULT '[]',
-                    equipped INTEGER DEFAULT 0,
-                    acquired_at TEXT
-                )
-            """)
+@contextmanager
+def get_db():
+    """
+    Yields a database connection with high-performance configuration.
+    Includes extensive corruption-prevention parameters (busy retry, memory temp store).
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    
+    # Enable SQLite's native busy retry handler (Wait up to 30s for lock release instead of crashing)
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    
+    # --- PHYSICAL SAFETY HARDENING ---
+    conn.execute("PRAGMA cache_size=-2000")     # Uses 2MB RAM cache to limit direct disk read/write cycles
+    conn.execute("PRAGMA temp_store=MEMORY")    # Keeps temporary storage inside RAM to prevent filesystem write corruptions
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS market_listings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    seller_id INTEGER,
-                    item_id INTEGER,
-                    quantity INTEGER,
-                    price_per_unit INTEGER,
-                    total_price INTEGER,
-                    listed_at TEXT,
-                    active INTEGER DEFAULT 1
-                )
-            """)
 
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS jobs (
-                    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT,
-                    description TEXT,
-                    base_salary INTEGER,
-                    max_promotions INTEGER,
-                    promotion_bonus INTEGER,
-                    requirements TEXT
-                )
-            """)
+# ── Schema init & Migration Engine ─────────────────────────────────────────────
 
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS pets (
-                    pet_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    pet_type TEXT,
-                    name TEXT,
-                    level INTEGER DEFAULT 1,
-                    xp INTEGER DEFAULT 0,
-                    happiness INTEGER DEFAULT 100,
-                    hunger INTEGER DEFAULT 100,
-                    strength INTEGER DEFAULT 10,
-                    defense INTEGER DEFAULT 10,
-                    speed INTEGER DEFAULT 10,
-                    intelligence INTEGER DEFAULT 10,
-                    active INTEGER DEFAULT 0,
-                    adventure_count INTEGER DEFAULT 0
-                )
-            """)
+def init_db():
+    # Set the persistent Write-Ahead Logging (WAL) mode ONCE on a single connection
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    try:
+        # WAL mode optimizes write performance while reducing risk of full database file corruption
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA wal_autocheckpoint=1000") # Auto-saves WAL changes back to primary .db file safely
+        
+        # PHYSICAL SECURITY STRUCTURAL AUDIT: Diagnose existing database structure health on startup
+        cursor = conn.execute("PRAGMA quick_check")
+        result = cursor.fetchone()
+        if result and result[0] != "ok":
+            print(f"[FATAL DATABASE SECURITY ALERT] Physical file structure check failed: {result[0]}")
+        else:
+            print("[DATABASE INTEGRITY CHECK] Physical file structures are fully healthy and verified.")
+            
+        conn.commit()
+    except Exception as e:
+        print(f"[DATABASE INIT WARNING] WAL and security audit setup failed: {e}")
+    finally:
+        conn.close()
 
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS properties (
-                    property_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    property_type TEXT,
-                    name TEXT,
-                    level INTEGER DEFAULT 1,
-                    value INTEGER,
-                    income_per_hour INTEGER,
-                    last_collection TEXT
-                )
-            """)
+    with get_db() as db:
+        # Users Table (Contains the accepted_terms security column)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id     INTEGER PRIMARY KEY,
+                username    TEXT    NOT NULL,
+                wallet      INTEGER NOT NULL DEFAULT 0,
+                bank        INTEGER NOT NULL DEFAULT 0,
+                reputation  INTEGER NOT NULL DEFAULT 0,
+                level       INTEGER NOT NULL DEFAULT 1,
+                xp          INTEGER NOT NULL DEFAULT 0,
+                accepted_terms INTEGER NOT NULL DEFAULT 0
+            )
+        """)
 
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS enchantments (
-                    enchantment_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT,
-                    description TEXT,
-                    effect_type TEXT,
-                    effect_value REAL,
-                    rarity TEXT,
-                    applicable_categories TEXT
-                )
-            """)
+        # Automated Schema Migrator: Safely alter existing users table if column is missing!
+        try:
+            cursor = db.execute("PRAGMA table_info(users)")
+            columns = [row["name"] for row in cursor.fetchall()]
+            
+            if "accepted_terms" not in columns:
+                db.execute("ALTER TABLE users ADD COLUMN accepted_terms INTEGER NOT NULL DEFAULT 0")
+                print("[DATABASE MIGRATION] Safely altered 'users' table to add 'accepted_terms' column.")
+        except Exception as migration_err:
+            print(f"[DATABASE MIGRATION WARNING] Failed column migration: {migration_err}")
 
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS user_perks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    perk_id TEXT,
-                    activated_at TEXT,
-                    expires_at TEXT,
-                    active INTEGER DEFAULT 1
-                )
-            """)
+        # Market
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS market (
+                item_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT    NOT NULL UNIQUE,
+                base_price  INTEGER NOT NULL,
+                current_price REAL  NOT NULL,
+                demand      REAL    NOT NULL DEFAULT 1.0,
+                supply      REAL    NOT NULL DEFAULT 1.0
+            )
+        """)
 
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS perks_catalog (
-                    perk_id TEXT PRIMARY KEY,
-                    name TEXT,
-                    description TEXT,
-                    cost INTEGER,
-                    duration_hours INTEGER,
-                    effect_type TEXT,
-                    effect_value REAL,
-                    max_stack INTEGER DEFAULT 1
-                )
-            """)
+        # Inventory
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS inventory (
+                user_id     INTEGER,
+                item_name   TEXT,
+                quantity    INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, item_name),
+                FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
+            )
+        """)
 
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS potions_catalog (
-                    potion_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT,
-                    description TEXT,
-                    effect_type TEXT,
-                    effect_value REAL,
-                    duration_minutes INTEGER,
-                    rarity TEXT,
-                    buy_price INTEGER,
-                    sell_price INTEGER
-                )
-            """)
+        # Daily
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS daily (
+                user_id     INTEGER PRIMARY KEY,
+                last_claim  INTEGER NOT NULL DEFAULT 0,
+                streak      INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
+            )
+        """)
 
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS user_potions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    potion_id INTEGER,
-                    quantity INTEGER DEFAULT 1,
-                    brewed_at TEXT
-                )
-            """)
 
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS transactions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    transaction_type TEXT,
-                    amount INTEGER,
-                    description TEXT,
-                    timestamp TEXT
-                )
-            """)
+# ── User Profile & Dynamic Integrity Management ─────────────────────────────────
 
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS cooldowns (
-                    user_id INTEGER,
-                    command_name TEXT,
-                    used_at TEXT,
-                    PRIMARY KEY (user_id, command_name)
-                )
-            """)
+def ensure_user(user_id: int, username: str = "Unknown User"):
+    """
+    Ensures that a user profile exists in the users table.
+    If the user does not exist, a new profile is initialized.
+    Exposed globally to satisfy queries inside active command cogs.
+    """
+    with get_db() as db:
+        row = db.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not row:
+            db.execute(
+                """INSERT OR IGNORE INTO users (user_id, username, wallet, bank)
+                   VALUES (?, ?, ?, ?)""",
+                (user_id, username, STARTING_BALANCE, STARTING_BANK),
+            )
 
-            await db.commit()
-            await self._seed_data(db)
 
-    async def _seed_data(self, db: aiosqlite.Connection):
-        cursor = await db.execute("SELECT COUNT(*) FROM items")
-        count = await cursor.fetchone()
-        if count[0] == 0:
-            items = [
-                ("Wooden Sword", "A basic training sword.", "weapon", 100, 100, "common", 1, 0, 1, 0),
-                ("Iron Sword", "A sturdy iron blade.", "weapon", 500, 500, "uncommon", 1, 0, 1, 0),
-                ("Dragon Slayer", "Legendary sword of heroes.", "weapon", 5000, 5000, "legendary", 1, 0, 1, 0),
-                ("Leather Armor", "Light protection.", "armor", 150, 150, "common", 1, 0, 1, 0),
-                ("Steel Plate", "Heavy duty armor.", "armor", 800, 800, "uncommon", 1, 0, 1, 0),
-                ("Mythic Robes", "Enchanted wizard robes.", "armor", 4000, 4000, "epic", 1, 0, 1, 0),
-                ("Pickaxe", "For mining ore.", "tool", 200, 200, "common", 0, 0, 0, 0),
-                ("Fishing Rod", "Catch fish easily.", "tool", 150, 150, "common", 0, 0, 0, 0),
-                ("Iron Ore", "Raw metal material.", "material", 50, 50, "common", 0, 0, 0, 1),
-                ("Gold Ore", "Precious metal.", "material", 200, 200, "uncommon", 0, 0, 0, 1),
-                ("Diamond", "Extremely rare gem.", "material", 2000, 2000, "rare", 0, 0, 0, 1),
-                ("Health Potion", "Restores health.", "consumable", 50, 50, "common", 0, 1, 0, 0),
-                ("Bunny Cookie", "A tasty treat.", "consumable", 25, 25, "common", 0, 1, 0, 0),
-                ("Golden Carrot", "Rare bunny delicacy.", "consumable", 300, 300, "rare", 0, 1, 0, 0),
-                ("Ancient Coin", "A collectible relic.", "collectible", 1000, 1000, "rare", 0, 0, 0, 0),
-                ("Crown Jewel", "The ultimate collectible.", "collectible", 10000, 10000, "legendary", 0, 0, 0, 0),
-                ("Pet Food", "Nutritious pet meal.", "pet_item", 30, 30, "common", 0, 1, 0, 0),
-                ("Training Treat", "Boosts pet stats.", "pet_item", 100, 100, "uncommon", 0, 1, 0, 0),
-                ("Small House Deed", "Property ownership paper.", "property_deed", 5000, 5000, "uncommon", 0, 0, 0, 0),
-                ("Castle Deed", "Majestic castle deed.", "property_deed", 50000, 50000, "legendary", 0, 0, 0, 0),
-                ("Enchant Scroll", "Used for enchanting.", "enchantment_scroll", 250, 250, "uncommon", 0, 1, 0, 0),
-            ]
-            for item in items:
-                await db.execute("""
-                    INSERT INTO items (name, description, category, base_value, current_value, rarity, enchantable, usable, equipable, craftable)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, item)
+def get_user(user_id: int):
+    with get_db() as db:
+        return db.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
 
-        cursor = await db.execute("SELECT COUNT(*) FROM jobs")
-        count = await cursor.fetchone()
-        if count[0] == 0:
-            jobs = [
-                ("Cashier", "Handle transactions.", 100, 3, 50, "{}"),
-                ("Farmer", "Grow crops.", 120, 4, 60, "{}"),
-                ("Miner", "Extract ore.", 150, 5, 75, '{"level": 5}'),
-                ("Fisher", "Catch fish.", 130, 4, 65, "{}"),
-                ("Hunter", "Track beasts.", 140, 4, 70, '{"level": 3}'),
-                ("Chef", "Cook meals.", 160, 5, 80, "{}"),
-                ("Blacksmith", "Forge weapons.", 200, 5, 100, '{"level": 10}'),
-                ("Merchant", "Trade goods.", 180, 6, 90, '{"level": 8}'),
-                ("Guard", "Protect the town.", 170, 4, 85, '{"level": 5}'),
-                ("Wizard", "Cast spells.", 250, 5, 125, '{"level": 15}'),
-                ("Thief", "Steal treasures.", 220, 4, 110, '{"level": 12}'),
-                ("Banker", "Manage finances.", 300, 6, 150, '{"level": 20}'),
-            ]
-            for job in jobs:
-                await db.execute("""
-                    INSERT INTO jobs (name, description, base_salary, max_promotions, promotion_bonus, requirements)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, job)
 
-        cursor = await db.execute("SELECT COUNT(*) FROM enchantments")
-        count = await cursor.fetchone()
-        if count[0] == 0:
-            enchants = [
-                ("Sharp", "+20% damage for weapons.", "damage", 0.2, "common", '["weapon"]'),
-                ("Lucky", "+15% luck.", "luck", 0.15, "uncommon", '["weapon", "armor", "tool"]'),
-                ("Wealthy", "+10% coin gain.", "income", 0.1, "rare", '["armor", "tool"]'),
-                ("Swift", "+10% speed.", "speed", 0.1, "common", '["armor", "tool"]'),
-                ("Sturdy", "+25% defense.", "defense", 0.25, "uncommon", '["armor"]'),
-                ("Wise", "+20% XP gain.", "xp", 0.2, "rare", '["armor", "tool"]'),
-            ]
-            for e in enchants:
-                await db.execute("""
-                    INSERT INTO enchantments (name, description, effect_type, effect_value, rarity, applicable_categories)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, e)
+def create_user(user_id: int, username: str):
+    with get_db() as db:
+        db.execute(
+            """INSERT OR IGNORE INTO users (user_id, username, wallet, bank)
+               VALUES (?, ?, ?, ?)""",
+            (user_id, username, STARTING_BALANCE, STARTING_BANK),
+        )
 
-        cursor = await db.execute("SELECT COUNT(*) FROM perks_catalog")
-        count = await cursor.fetchone()
-        if count[0] == 0:
-            perks = [
-                ("double_xp", "Double XP", "Earn 2x experience points.", 5000, 24, "xp", 2.0, 1),
-                ("double_coin", "Double Coins", "Earn 2x Bunny-Coins.", 8000, 24, "income", 2.0, 1),
-                ("lucky_roll", "Lucky Roll", "+25% gambling win chance.", 3000, 12, "luck", 0.25, 1),
-                ("market_master", "Market Master", "No market tax.", 10000, 48, "tax", 0.0, 1),
-                ("adventure_boost", "Adventure Boost", "Better adventure rewards.", 4000, 24, "adventure", 1.5, 1),
-            ]
-            for p in perks:
-                await db.execute("""
-                    INSERT INTO perks_catalog (perk_id, name, description, cost, duration_hours, effect_type, effect_value, max_stack)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, p)
 
-        cursor = await db.execute("SELECT COUNT(*) FROM potions_catalog")
-        count = await cursor.fetchone()
-        if count[0] == 0:
-            potions = [
-                ("Health Potion", "Restores 50 HP in adventures.", "health", 50, 30, "common", 100, 50),
-                ("Strength Potion", "+20 strength for 1 hour.", "strength", 20, 60, "uncommon", 500, 250),
-                ("Luck Potion", "+15% luck for 2 hours.", "luck", 15, 120, "rare", 1000, 500),
-                ("Wealth Potion", "+50% coin find for 1 hour.", "wealth", 0.5, 60, "epic", 2000, 1000),
-                ("Speed Potion", "+30 speed for 30 min.", "speed", 30, 30, "uncommon", 750, 375),
-            ]
-            for p in potions:
-                await db.execute("""
-                    INSERT INTO potions_catalog (name, description, effect_type, effect_value, duration_minutes, rarity, buy_price, sell_price)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, p)
+def update_user(user_id: int, **kwargs):
+    if not kwargs:
+        return
+    query = "UPDATE users SET " + ", ".join([f"{k}=?" for k in kwargs.keys()]) + " WHERE user_id=?"
+    values = list(kwargs.values()) + [user_id]
+    with get_db() as db:
+        db.execute(query, values)
 
-        await db.commit()
 
-    async def get_user(self, user_id: int, username: str = None) -> Dict[str, Any]:
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-            row = await cursor.fetchone()
-            if not row:
-                now = datetime.now().isoformat()
-                await db.execute("""
-                    INSERT INTO users (user_id, username, created_at)
-                    VALUES (?, ?, ?)
-                """, (user_id, username or "Unknown", now))
-                await db.commit()
-                return await self.get_user(user_id, username)
-            return dict(zip([c[0] for c in cursor.description], row))
+# ── Market ────────────────────────────────────────────────────────────────────
 
-    async def update_user(self, user_id: int, **kwargs):
-        async with aiosqlite.connect(self.db_path) as db:
-            for key, value in kwargs.items():
-                await db.execute(f"UPDATE users SET {key} = ? WHERE user_id = ?", (value, user_id))
-            await db.commit()
+def get_market_items():
+    with get_db() as db:
+        return db.execute("SELECT * FROM market").fetchall()
 
-    async def add_balance(self, user_id: int, amount: int):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-            await db.commit()
 
-    async def add_bank(self, user_id: int, amount: int):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE users SET bank_balance = bank_balance + ? WHERE user_id = ?", (amount, user_id))
-            await db.commit()
+def get_market_item(item_name: str):
+    with get_db() as db:
+        return db.execute("SELECT * FROM market WHERE name=?", (item_name,)).fetchone()
 
-    async def add_xp(self, user_id: int, amount: int):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE users SET xp = xp + ? WHERE user_id = ?", (amount, user_id))
-            await db.commit()
 
-    async def get_inventory(self, user_id: int) -> List[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
-                SELECT i.*, it.name, it.category, it.rarity, it.current_value 
-                FROM inventory i
-                JOIN items it ON i.item_id = it.item_id
-                WHERE i.user_id = ?
-            """, (user_id,))
-            rows = await cursor.fetchall()
-            return [dict(zip([c[0] for c in cursor.description], row)) for row in rows]
+def add_market_item(name: str, base_price: int):
+    with get_db() as db:
+        db.execute(
+            """INSERT OR IGNORE INTO market (name, base_price, current_price)
+               VALUES (?, ?, ?)""",
+            (name, base_price, float(base_price)),
+        )
 
-    async def add_item(self, user_id: int, item_id: int, quantity: int = 1, enchantments: str = "[]"):
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
-                SELECT id, quantity FROM inventory WHERE user_id = ? AND item_id = ? AND enchantments = ?
-            """, (user_id, item_id, enchantments))
-            row = await cursor.fetchone()
-            if row:
-                await db.execute("UPDATE inventory SET quantity = quantity + ? WHERE id = ?", (quantity, row[0]))
-            else:
-                now = datetime.now().isoformat()
-                await db.execute("""
-                    INSERT INTO inventory (user_id, item_id, quantity, enchantments, acquired_at)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (user_id, item_id, quantity, enchantments, now))
-            await db.commit()
 
-    async def remove_item(self, user_id: int, item_id: int, quantity: int = 1):
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
-                SELECT id, quantity FROM inventory WHERE user_id = ? AND item_id = ?
-            """, (user_id, item_id))
-            row = await cursor.fetchone()
-            if row:
-                if row[1] <= quantity:
-                    await db.execute("DELETE FROM inventory WHERE id = ?", (row[0],))
-                else:
-                    await db.execute("UPDATE inventory SET quantity = quantity - ? WHERE id = ?", (quantity, row[0]))
-                await db.commit()
-                return True
-            return False
+def update_market_price(item_name: str, change_pct: float, is_buy: bool):
+    with get_db() as db:
+        item = db.execute("SELECT * FROM market WHERE name=?", (item_name,)).fetchone()
+        if not item:
+            return
+        
+        # Calculate shifts
+        old_price = item["current_price"]
+        old_demand = item["demand"]
+        old_supply = item["supply"]
 
-    async def get_item(self, item_id: int) -> Optional[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("SELECT * FROM items WHERE item_id = ?", (item_id,))
-            row = await cursor.fetchone()
-            if row:
-                return dict(zip([c[0] for c in cursor.description], row))
-            return None
+        if is_buy:
+            new_demand = old_demand + DEMAND_SHIFT_BUY
+            new_supply = max(0.1, old_supply - SUPPLY_SHIFT_BUY)
+        else:
+            new_demand = max(0.1, old_demand - DEMAND_SHIFT_SELL)
+            new_supply = old_supply + SUPPLY_SHIFT_SELL
 
-    async def get_item_by_name(self, name: str) -> Optional[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("SELECT * FROM items WHERE LOWER(name) = LOWER(?)", (name,))
-            row = await cursor.fetchone()
-            if row:
-                return dict(zip([c[0] for c in cursor.description], row))
-            return None
+        # Price update
+        new_price = item["base_price"] * (new_demand / new_supply)
+        new_price = max(item["base_price"] * PRICE_CLAMP_LOW, min(item["base_price"] * PRICE_CLAMP_HIGH, new_price))
 
-    async def update_item_value(self, item_id: int, demand_delta: float = 0, supply_delta: float = 0):
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("SELECT base_value, demand_score, supply_score FROM items WHERE item_id = ?", (item_id,))
-            row = await cursor.fetchone()
-            if not row:
-                return
-            base_value, demand, supply = row
-            new_demand = max(0, demand + demand_delta)
-            new_supply = max(0, supply + supply_delta)
-            multiplier = 1 + (new_demand - new_supply) * 0.005
-            multiplier = max(0.1, min(5.0, multiplier))
-            new_value = int(base_value * multiplier)
-            now = datetime.now().isoformat()
-            await db.execute("""
-                UPDATE items SET demand_score = ?, supply_score = ?, current_value = ?, last_value_update = ?
-                WHERE item_id = ?
-            """, (new_demand, new_supply, new_value, now, item_id))
-            await db.commit()
+        db.execute(
+            """UPDATE market SET current_price=?, demand=?, supply=?
+               WHERE name=?""",
+            (new_price, new_demand, new_supply, item_name),
+        )
 
-    async def add_transaction(self, user_id: int, t_type: str, amount: int, description: str):
-        async with aiosqlite.connect(self.db_path) as db:
-            now = datetime.now().isoformat()
-            await db.execute("""
-                INSERT INTO transactions (user_id, transaction_type, amount, description, timestamp)
-                VALUES (?, ?, ?, ?, ?)
-            """, (user_id, t_type, amount, description, now))
-            await db.commit()
 
-    async def check_cooldown(self, user_id: int, command: str, cooldown_seconds: int) -> bool:
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
-                SELECT used_at FROM cooldowns WHERE user_id = ? AND command_name = ?
-            """, (user_id, command))
-            row = await cursor.fetchone()
-            if not row:
-                return True
-            last = datetime.fromisoformat(row[0])
-            diff = (datetime.now() - last).total_seconds()
-            return diff >= cooldown_seconds
+# ── Inventory ─────────────────────────────────────────────────────────────────
 
-    async def set_cooldown(self, user_id: int, command: str):
-        async with aiosqlite.connect(self.db_path) as db:
-            now = datetime.now().isoformat()
-            await db.execute("""
-                INSERT OR REPLACE INTO cooldowns (user_id, command_name, used_at)
-                VALUES (?, ?, ?)
-            """, (user_id, command, now))
-            await db.commit()
+def get_inventory(user_id: int):
+    with get_db() as db:
+        return db.execute(
+            "SELECT * FROM inventory WHERE user_id=? AND quantity > 0",
+            (user_id,),
+        ).fetchall()
 
-    async def get_leaderboard(self, sort_by: str = "balance", limit: int = 10) -> List[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            valid_cols = ["balance", "bank_balance", "level", "xp", "prestige"]
-            if sort_by not in valid_cols:
-                sort_by = "balance"
-            cursor = await db.execute(f"""
-                SELECT user_id, username, {sort_by} as score,
-                       (balance + bank_balance) as net_worth,
-                       level, prestige
-                FROM users
-                ORDER BY {sort_by} DESC
-                LIMIT ?
-            """, (limit,))
-            rows = await cursor.fetchall()
-            return [dict(zip([c[0] for c in cursor.description], row)) for row in rows]
+
+def add_inventory_item(user_id: int, item_name: str, amount: int = 1):
+    with get_db() as db:
+        user = db.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not user:
+            db.execute(
+                "INSERT OR IGNORE INTO users (user_id, username, wallet, bank) VALUES (?, ?, ?, ?)",
+                (user_id, "Unknown User", STARTING_BALANCE, STARTING_BANK),
+            )
+
+        row = db.execute(
+            "SELECT * FROM inventory WHERE user_id=? AND item_name=?",
+            (user_id, item_name),
+        ).fetchone()
+        if not row:
+            db.execute(
+                "INSERT OR IGNORE INTO inventory (user_id, item_name, quantity) VALUES (?, ?, ?)",
+                (user_id, item_name, amount),
+            )
+        else:
+            db.execute(
+                "UPDATE inventory SET quantity=quantity+? WHERE user_id=? AND item_name=?",
+                (amount, user_id, item_name),
+            )
+
+
+def remove_inventory_item(user_id: int, item_name: str, amount: int = 1):
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM inventory WHERE user_id=? AND item_name=?",
+            (user_id, item_name),
+        ).fetchone()
+        if row:
+            new_qty = max(0, row["quantity"] - amount)
+            db.execute(
+                "UPDATE inventory SET quantity=? WHERE user_id=? AND item_name=?",
+                (new_qty, user_id, item_name),
+            )
+
+
+# ── Daily ─────────────────────────────────────────────────────────────────────
+
+def get_daily(user_id: int):
+    with get_db() as db:
+        user = db.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not user:
+            db.execute(
+                "INSERT OR IGNORE INTO users (user_id, username, wallet, bank) VALUES (?, ?, ?, ?)",
+                (user_id, "Unknown User", STARTING_BALANCE, STARTING_BANK),
+            )
+
+        row = db.execute("SELECT * FROM daily WHERE user_id=?", (user_id,)).fetchone()
+        if not row:
+            db.execute(
+                "INSERT OR IGNORE INTO daily (user_id) VALUES (?)", (user_id,)
+            )
+            return db.execute("SELECT * FROM daily WHERE user_id=?", (user_id,)).fetchone()
+        return row
+
+
+def update_daily(user_id: int, streak: int):
+    now = int(time.time())
+    with get_db() as db:
+        user = db.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not user:
+            db.execute(
+                "INSERT OR IGNORE INTO users (user_id, username, wallet, bank) VALUES (?, ?, ?, ?)",
+                (user_id, "Unknown User", STARTING_BALANCE, STARTING_BANK),
+            )
+
+        db.execute(
+            "UPDATE daily SET last_claim=?, streak=? WHERE user_id=?",
+            (now, streak, user_id),
+        )
+
+
+# ── Leaderboard ───────────────────────────────────────────────────────────────
+
+def get_leaderboard(kind: str = "wealth", limit: int = 10):
+    with get_db() as db:
+        if kind == "wealth":
+            return db.execute(
+                """SELECT username, wallet+bank AS total, level
+                   FROM users ORDER BY total DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        if kind == "level":
+            return db.execute(
+                "SELECT username, level, xp FROM users ORDER BY level DESC, xp DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        if kind == "reputation":
+            return db.execute(
+                "SELECT username, reputation, level FROM users ORDER BY reputation DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    return []
+
